@@ -12,6 +12,7 @@
 
 #include <BluetoothSerial.h>
 #include <Wire.h>
+#include "gganmea.h"
 #include "BNO08x_AOG.h"
 #include "haversine.h"
 
@@ -49,6 +50,9 @@ const int32_t serial_speed = 115200;
 #define SerialGPS Serial2
 
 BluetoothSerial SerialBT;
+
+char nmea_buffer[160];
+GGANMEA ggaparser(nmea_buffer,sizeof(nmea_buffer));
 
 //data we will use for compensation calculations
 float imu_heading;
@@ -121,6 +125,15 @@ void process_imu() {
 
 void output_gga() {
 	float heading;
+	double latitude;
+	double longitude;
+	double altitude;
+
+	bool new_gga = false;
+
+	latitude = ggaparser.getLatitude() / 10000000.0;
+	longitude = ggaparser.getLongitude() / 10000000.0;
+	altitude = ggaparser.getAltitude / 1000.0;
 
 	if (use_bno08x) {
 		;
@@ -133,19 +146,24 @@ void output_gga() {
 	//if we don't know our gyro offset, wait until we've moved a certain
 	//distance, and use that fix heading to calculate the gyro_offset.
 	} else {
+		heading = gga.
 		;
 		//heading = gga heading since we have no gyro;
 	}
 
-	if (imu_roll) {
+	if (imu_roll && (ggaparser.getFixType() == 4 ||
+	                 ggaparser.getFixType() == 5)) {
 		//use the imu_roll to do terrain comp, adjust lat, lon, and altitude
+		//build a new GGA sentence, transmit it via bluetooth, and over serial
+
+	} else {
+		//pass GGA sentence through unaltered.
+		Serial.write(nmea_buffer,nmea_buffer.sentence_length);
+		Serial.write('\n');
+		SerialBT.write(nmea_buffer,nmea_buffer.sentence_length);
+		SerialBT.write('\n');
 
 	}
-
-	//build a new GGA sentence, transmit it via bluetooth, and over serial
-
-
-
 
 	if (use_bno08x) {
 		bno08x_last_time = millis();
@@ -205,30 +223,28 @@ void setup()
 	}
 }
 
-
-
 void loop()
 {	
 	uint32_t current_time;
 
 	//Read RTCM data from bluetooth
-	if (SerialBT.available()) {
+	for (int8_t i=0; i < SerialBT.available(); i++) {
 		SerialGPS.write(SerialBT.read());
 	}
 
 	//Read NMEA data from GPS
-	if (SerialGPS.available()) {
-		//parse it;
-		;
-
-		//if we have a message, set is_triggered = true
-		if (use_bno08x) {
-			output_gga(); //this will set is_triggered
-		} else {
-			gps_ready_time = millis();
-			is_triggered = true;
+	//for (uint8_t i=0; i < SerialGPS.available(); i++) {
+	if (SerialGPS.available()) { //just one byte at a time?
+		if(ggaparser.process(SerialGPS.read()) {
+			//we've got a sentence
+			if (use_bno08x) {
+				output_gga(); //this will set is_triggered
+			} else {
+				gps_ready_time = millis();
+				is_triggered = true;
+			}
+			//break;
 		}
-			
 	}
 
 	current_time = millis();
