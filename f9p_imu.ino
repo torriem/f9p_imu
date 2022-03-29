@@ -12,7 +12,7 @@
 
 #include <BluetoothSerial.h>
 #include <Wire.h>
-#include "gganmea.h"
+#include "simplenmea.h"
 #include "BNO08x_AOG.h"
 #include "haversine.h"
 
@@ -21,7 +21,7 @@ bool use_bno08x = false;
 
 //BNO08x addresses to look for:
 const uint8_t bno08x_address[] = { 0x4A, 0x4B };
-const int8_t num_BNO08x_adresses = 2;
+const int8_t num_BNO08x_addresses = 2;
 uint8_t bno08xAddress;
 BNO080 bno08x;
 float bno08x_yawrate=0;
@@ -31,54 +31,77 @@ float bno08x_pitch=0;
 const uint16_t GYRO_LOOP_TIME=10;
 uint32_t last_gyro_time = 10;
 uint32_t bno08x_last_time = 10;
+bool swap_roll_pitch = false;
 
 //CMPS14
 #define CMPS14_ADDRESS 0x60
 
+bool is_triggered = false;
+
 //gps coordinate variables
 
-double last_lat = -300;
-double last_lon = -300;
+double last_lat = -301;
+double last_lon = -301;
 
 //Serial speeds
 const int32_t gps_speed = 57600;
 const int32_t serial_speed = 115200;
 
 //F9P serial port pins
-#define GPSRX 13 //??
-#define GPSTX 12 //??
+#define GPSRX 17 
+#define GPSTX 16
+
 #define SerialGPS Serial2
 
 BluetoothSerial SerialBT;
 
-char nmea_buffer[160];
-GGANMEA ggaparser(nmea_buffer,sizeof(nmea_buffer));
+char nmea_buffer[2][160]; //two buffers
+char *gga_buffer;
+char *vtg_buffer;
+uint8_t which_nmea_buffer=0;
+SimpleNMEAParser nmeaparser(nmea_buffer[0],sizeof(nmea_buffer[0]));
+uint32_t last_gga = 0;
+uint32_t last_vtg = 0;
+
+char gga_output[100];
+char vtg_output[80];
 
 //data we will use for compensation calculations
-float imu_heading;
-float imu_roll;
-float imu_pitch;
-float imu_yaw_rate;
+float imu_heading = 0;
+float imu_roll = 0;
+float imu_pitch = 0;
+float imu_yaw_rate = 0;
+float imu_gyro_offset = -401;
+
+#define SPEED_THRESHOLD 3 //3 kph
+#define FIX_HEADING_MIN 1 //1 metre
+#define YAW_RATE_THRESHOLD 6 //deg/sec
+
+#define INCHES 
+
+float antenna_height = 120 * 0.0254 /*metres/inch*/;
+float antenna_forward = 0;
+float antenna_left = 0;
 
 void process_bno08x (uint32_t delta) {
 	float gyro;
 
 	if (bno08x.dataAvailable()) {
-		gyro = bno08x.getGyroZ() * RAD_TO_DEG; //yaw rate deg/s
+		gyro = bno08x.getGyroZ() * haversine::toDegrees; //yaw rate deg/s
 		//invert sign?
 
-		bno08x_heading = bno08x.getYaw() * RAD_TO_DEG;
+		bno08x_heading = bno08x.getYaw() * haversine::toDegrees;
 		//invert sign?
 
 		if (bno08x_heading < 0)
 			bno08x_heading += 360;
 
 		if (swap_roll_pitch) {
-			bno08x_roll = bno08x.getPitch() * RAD_TO_DEG;
-			bno08x_pitch = bno08x.getRoll() * RAD_TO_DEG;
+			bno08x_roll = bno08x.getPitch() * haversine::toDegrees;
+			bno08x_pitch = bno08x.getRoll() * haversine::toDegrees;
 		} else {
-			bno08x_roll = bno08x.getRoll() * RAD_TO_DEG;
-			bno08x_pitch = bno08x.getPitch() * RAD_TO_DEG;
+			bno08x_roll = bno08x.getRoll() * haversine::toDegrees;
+			bno08x_pitch = bno08x.getPitch() * haversine::toDegrees;
 			//invert pitch sign?
 		}
 
@@ -119,59 +142,207 @@ void process_imu() {
 		imu_heading = bno08x_heading;
 		imu_pitch = bno08x_pitch;
 		imu_roll = bno08x_roll;
-		imu_yaw_rate = bno08x_yaw_rate;
+		imu_yaw_rate = bno08x_yawrate;
 	}
 }
 
 void output_gga() {
 	float heading;
+	float gyro_heading;
 	double latitude;
 	double longitude;
 	double altitude;
+	long tempalt;
 
 	bool new_gga = false;
 
-	latitude = ggaparser.getLatitude() / 10000000.0;
-	longitude = ggaparser.getLongitude() / 10000000.0;
-	altitude = ggaparser.getAltitude / 1000.0;
+	heading = -301;
+
+	latitude = nmeaparser.getLatitude() / 10000000.0;
+	longitude = nmeaparser.getLongitude() / 10000000.0;
+
+	if(nmeaparser.getAltitude(tempalt)) {
+		altitude = tempalt / 1000.0;
+	} else
+		altitude = 0;
 
 	if (use_bno08x) {
-		;
-	//if GGA speed is > threshold, calculate gyro offset using it, and
-	//use GGA heading for terrain compensation below, perhaps filtering it
+		if (imu_gyro_offset < -400) {
+			//no offset is known.
 
-	//if we know our gyro offset, if we're slow or turning very fast, use the
-	//gyro + offset as the heading for doing terrain compensation.
+			if (nmeaparser.getSpeed() > SPEED_THRESHOLD) {
+				//assume we're going forward
+				heading = nmeaparser.getCourse();
+			} else {
+				//assume going forward, but it's still slow, so we need to go at least
+				//some distance
+				if (last_lat < -300) {
+					last_lat = nmeaparser.getLatitude() / 10000000.0;
+					last_lon = nmeaparser.getLongitude() / 10000000.0;
+				} else if (haversine::distance(last_lat, last_lon,
+					       nmeaparser.getLatitude() / 10000000.0,
+						   nmeaparser.getLongitude() / 10000000.0) > FIX_HEADING_MIN) {
+					heading = haversine::bearing_degrees(
+					              last_lat, last_lon,
+					              nmeaparser.getLatitude() / 10000000.0,
+								  nmeaparser.getLongitude() / 10000000.0);
+					
+				}
 
-	//if we don't know our gyro offset, wait until we've moved a certain
-	//distance, and use that fix heading to calculate the gyro_offset.
+				if(heading > -300) {
+					//we have a heading from GPS
+					imu_gyro_offset = heading - imu_heading;
+				}
+			}
+		} else {
+			//we have a gyro offset we can use if needed.
+
+			if (nmeaparser.getSpeed() > SPEED_THRESHOLD &&
+			    imu_yaw_rate < YAW_RATE_THRESHOLD) {
+				//assume we're going forward
+				
+				//take gps heading and merge it with gyro+offset maybe?
+				gyro_heading = imu_heading + imu_gyro_offset;
+				if (gyro_heading <0) gyro_heading += 360;
+				else if(gyro_heading >=360) gyro_heading -= 360;
+
+				heading = nmeaparser.getCourse() * 0.6 +
+				          gyro_heading * 0.4;
+
+				//recompute offset
+				imu_gyro_offset = heading - imu_heading;
+
+			} else {
+				//we're either going really slow, or turning very fast
+				//rely on gyro with offset
+				heading = imu_heading + imu_gyro_offset;
+				if (heading < 0) heading += 360;
+				else if (heading >= 360) heading -= 360;
+			}
+
+		}
 	} else {
-		heading = gga.
-		;
-		//heading = gga heading since we have no gyro;
+		heading = nmeaparser.getCourse();
+		//we may have roll information from cmps14
 	}
 
-	if (imu_roll && (ggaparser.getFixType() == 4 ||
-	                 ggaparser.getFixType() == 5)) {
+	if (heading > -300 && imu_roll &&
+	    (nmeaparser.getFixType() == 4 ||
+	    (nmeaparser.getFixType() == 5))) {
+
+		double lat, lon, alt;
+
+		float heading90;
+		float tilt_offset;
+		float center_offset = 0;
+		float alt_offset1;
+		float alt_offset2 = 0;
+
+		long latdegmin;
+		long londegmin;
+		long latminfrac;
+		long lonminfrac;
+		char latdir, londir;
+
 		//use the imu_roll to do terrain comp, adjust lat, lon, and altitude
 		//build a new GGA sentence, transmit it via bluetooth, and over serial
 
+		lat = latitude / 10000000.0;
+		lon = longitude / 10000000.0;
+		alt = altitude / 1000.0;
+
+		heading90 = heading + 90;
+		if (heading90 >= 360) heading90 -= 360;
+
+		if (antenna_left) {
+			center_offset = cos(imu_roll * haversine::toRadians) * antenna_left;
+			alt_offset2 = sin(imu_roll * haversine::toRadians) * center_offset;
+		}
+
+		tilt_offset = sin(imu_roll * haversine::toRadians) * antenna_height;
+		alt_offset1 = cos(imu_roll * haversine::toRadians) * antenna_height;
+
+		haversine::move_distance_bearing(lat, lon, heading90, tilt_offset + center_offset);
+		alt -= (alt_offset1 - alt_offset2);
+
+		if (antenna_forward) {
+			//translate from GPS back to axle
+			haversine::move_distance_bearing(lat, lon, heading, -antenna_forward);
+		}
+
+		//make a new GGA message. Copy unchanged parts from the original message
+		//convert lat and lon to DDMM.xxxxxx
+
+
+		if (lat < 0) {
+			latdir = 'S';
+			lat = -lat;
+		} else {
+			latdir = 'N';
+		}
+
+		if (lon < 0) {
+			londir = 'W';
+			lon = -lon;
+		} else {
+			londir = 'E';
+		}
+
+		latdegmin = lat; //get degrees part
+		londegmin = lon;
+
+		lat = (lat - latdegmin) * 60.0; //isolate the minutes
+		lon = (lon - londegmin) * 60.0;
+
+		latdegmin = latdegmin * 100 + lat; //add on minutes digits
+		londegmin = londegmin * 100 + lon;
+
+		lat = lat - (int)lat; //isolate fractional part
+		lon = lon - (int)lon;
+
+		latminfrac = lat * 10000000;
+		lonminfrac = lon * 10000000;
+
+		//grab the original timestamp and stuff before the lat and lon
+		memcpy(gga_output,gga_buffer,nmeaparser.before_latlon);
+		sprintf(gga_output+nmeaparser.before_latlon+1,"%04d.%07d,%c,%05d.%07d,%c,",
+		        latdegmin, latminfrac, latdir,
+				londegmin, lonminfrac, londir);
+
+		//copy the stuff after lat and lon, up to the altitude
+		gga_buffer[nmeaparser.before_altitude] = '\0';
+		strcat(gga_output,gga_buffer+nmeaparser.after_latlon);
+
+		//write the modified altitude
+		sprintf(gga_output+strlen(gga_output),"%3.3f,", altitude);
+
+		//now grab the rest of the original sentence
+		strcat(gga_output,gga_buffer+nmeaparser.after_altitude);
+
+		//redo the checksum
+		//TODO
+
+		Serial.write(gga_output);
+		Serial.write('\n');
+
 	} else {
 		//pass GGA sentence through unaltered.
-		Serial.write(nmea_buffer,nmea_buffer.sentence_length);
+		Serial.write(gga_buffer,strnlen(gga_buffer,160));
 		Serial.write('\n');
-		SerialBT.write(nmea_buffer,nmea_buffer.sentence_length);
-		SerialBT.write('\n');
+		Serial.write(vtg_buffer,strnlen(vtg_buffer,160));
+		Serial.write('\n');
 
+		SerialBT.write(gga_buffer,strnlen(gga_buffer,160));
+		SerialBT.write('\n');
+		SerialBT.write(vtg_buffer,strnlen(vtg_buffer,160));
+		SerialBT.write('\n');
 	}
 
 	if (use_bno08x) {
 		bno08x_last_time = millis();
 		is_triggered = true;
 	}
-
-
-
+}
 
 void setup()
 {
@@ -179,25 +350,28 @@ void setup()
 	SerialGPS.begin(gps_speed, SERIAL_8N1, GPSRX, GPSTX);
 	SerialBT.begin("esp32_f9p");
 
-	pinMode(13, OUTPUT); //for an LED
+	delay(5000);
+	Serial.println("F9P IMU integration.");
+
+	//pinMode(13, OUTPUT); //for an LED
 	//another LED to indicate IMU presence
-	pinMode(IMULED, OUTPUT);
+	//pinMode(IMULED, OUTPUT);
 
 	Wire.begin();
 
 	uint8_t error;
 
-	Wire.beginTransmission(CPMS14_ADDRESS);
+	Wire.beginTransmission(CMPS14_ADDRESS);
 
 	if(!Wire.endTransmission()) {
 		use_cmps = true;
 	} else {
 		//try the BNO08x
 		for (int8_t i=0 ; i < num_BNO08x_addresses ; i++) {
-			Wire.beginTransmission(bno08x_address[i])
+			Wire.beginTransmission(bno08x_address[i]);
 			if (! Wire.endTransmission() ) {
 				//we found the BNO08x
-				if (bno08x.begin(bno08x_address[i]) {
+				if (bno08x.begin(bno08x_address[i])) {
 					//increase I2C data rate to 400 kHz
 					Wire.setClock(400000);
 
@@ -211,15 +385,21 @@ void setup()
 							break;
 						}
 					}
+				} else {
+					Serial.println("Found BNO08x but could not communicate.");
 				}
+			} else {
+				Serial.println("BNO08x not at address.");
+
 			}
 		}
 	}
 
 	if(use_cmps || use_bno08x) {
-		digitalWrite(IMULED, HIGH);
+		Serial.println("Got BNO08x.");
+		//digitalWrite(IMULED, HIGH);
 	} else {
-		digitalWrite(IMULED, LOW);
+		//digitalWrite(IMULED, LOW);
 	}
 }
 
@@ -235,15 +415,50 @@ void loop()
 	//Read NMEA data from GPS
 	//for (uint8_t i=0; i < SerialGPS.available(); i++) {
 	if (SerialGPS.available()) { //just one byte at a time?
-		if(ggaparser.process(SerialGPS.read()) {
+		if(nmeaparser.process(SerialGPS.read())) {
 			//we've got a sentence
-			if (use_bno08x) {
-				output_gga(); //this will set is_triggered
-			} else {
-				gps_ready_time = millis();
-				is_triggered = true;
+
+			if (!strcmp(nmeaparser.getMessageID(), "GGA")) {
+				last_gga = millis();
+
+				//save a pointer to the gga buffer
+				gga_buffer = nmea_buffer[which_nmea_buffer];
+				
+				//select the other buffer
+				which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
+				nmeaparser.setBuffer(nmea_buffer[which_nmea_buffer], sizeof(nmea_buffer[0]));
+
+				//did we have a vtg message very recently?
+				if (millis() - last_vtg < 10) {
+					if (use_bno08x) {
+						output_gga(); //this will set is_triggered
+					} else {
+						gps_ready_time = millis();
+						is_triggered = true;
+					}
+					//break;
+				}
+			} else if (!strcmp(nmeaparser.getMessageID(), "VTG")) {
+				last_vtg = millis();
+
+				//save a pointer to the vtg buffer
+				vtg_buffer = nmea_buffer[which_nmea_buffer];
+
+				//select the other buffer
+				which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
+				nmeaparser.setBuffer(nmea_buffer[which_nmea_buffer], sizeof(nmea_buffer[0]));
+
+				//did we have a gga message very recently?
+				if (millis() - last_gga < 10) {
+					if (use_bno08x) {
+						output_gga(); //this will set is_triggered
+					} else {
+						gps_ready_time = millis();
+						is_triggered = true;
+					}
+					//break;
+				}
 			}
-			//break;
 		}
 	}
 
@@ -270,8 +485,8 @@ void loop()
 
 			is_triggered = false;
 			current_time = millis();
-
-
+		}
+	}
 }
 
 
