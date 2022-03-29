@@ -330,7 +330,7 @@ bool SimpleNMEAParser::processGGA(const char *s)
 	before_altitude = s - _buffer;
 	_altitude = parseFloat(s, 3, &s);
 	_altitudeValid = true;
-	afer_altitude = s - _buffer;
+	after_altitude = s - _buffer;
 	// That's all we care about
 	
 	return true;
