@@ -86,17 +86,18 @@ float antenna_height = 120 * 0.0254 /*metres/inch*/;
 float antenna_forward = 0;
 float antenna_left = 0;
 
-void add_checksum(char *buffer) {
-	int16_t sum = 0;
+void add_checksum(char *buffer, uint8_t buf_size) {
+	uint8_t sum = 0;
 	char tmp;
 	char checksum[4];
 
-	int8_t buf_size = strlen(buffer);
+	//Serial.println(buf_size);
 	
-	for (int8_t i; i=0; i < buf_size)
+	for (int8_t i=1; i < buf_size ; i++)
+		
 		sum ^= buffer[i];
 
-	sum = sum & 0x0ff;
+	Serial.println(sum,16);
 	sprintf(checksum,"*%02X",sum);
 	strcat(buffer,checksum);
 }
@@ -352,12 +353,12 @@ void output_gga() {
 		lonminfrac = longitude * 1000000.0;
 
 
-		Serial.write((uint8_t *)gga_buffer,strnlen((const char*)gga_buffer,160));
-		Serial.write('\n');
+		//Serial.write((uint8_t *)gga_buffer,strnlen((const char*)gga_buffer,160));
+		//Serial.write('\n');
 
 		//grab the original timestamp and stuff before the lat and lon
-		memcpy(gga_output,gga_buffer,nmeaparser.before_latlon-1);
-		sprintf(gga_output+nmeaparser.before_latlon+1,"%04d.%06d,%c,%05d.%06d,%c,",
+		memcpy(gga_output,gga_buffer,nmeaparser.before_latlon);
+		sprintf(gga_output+nmeaparser.before_latlon,"%04d.%06d,%c,%05d.%06d,%c,",
 		        latdegmin, latminfrac, latdir,
 				londegmin, lonminfrac, londir);
 
@@ -369,16 +370,25 @@ void output_gga() {
 		sprintf(gga_output+strlen(gga_output),"%.2f,", altitude);
 
 		//now grab the rest of the original sentence
-		strncat(gga_output,gga_buffer+nmeaparser.after_altitude,strlen(gga_buffer+nmeaparser.after_altitude) - 3);
+		strcat(gga_output,gga_buffer+nmeaparser.after_altitude);
+
+		uint8_t buf_size = strlen(gga_output)-3;
+		gga_output[buf_size] = 0;
 
 		//redo the checksum
-		add_checksum(gga_output);
+		add_checksum(gga_output, buf_size);
 
-		Serial.write(gga_output);
-		Serial.write('\n');
+		Serial.println(gga_output);
+		SerialBT.println(gga_output);
 
 	} else {
 		//pass GGA sentence through unaltered.
+		Serial.println(gga_buffer);
+		Serial.println(vtg_buffer);
+
+		SerialBT.println(gga_buffer);
+		SerialBT.println(vtg_buffer);
+		/*
 		Serial.write((uint8_t *)gga_buffer,strnlen((const char*)gga_buffer,160));
 		Serial.write('\n');
 		Serial.write((uint8_t *)vtg_buffer,strnlen((const char*)vtg_buffer,160));
@@ -388,6 +398,7 @@ void output_gga() {
 		SerialBT.write('\n');
 		SerialBT.write((uint8_t *)vtg_buffer,strnlen((const char*)vtg_buffer,160));
 		SerialBT.write('\n');
+		*/
 	}
 
 	if (use_bno08x) {
