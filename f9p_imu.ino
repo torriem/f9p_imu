@@ -32,9 +32,12 @@ const uint16_t GYRO_LOOP_TIME=10;
 uint32_t last_gyro_time = 10;
 uint32_t bno08x_last_time = 10;
 bool swap_roll_pitch = false;
+const uint16_t IMU_DELAY_TIME = 190; //10 ms before the next message
 
 //CMPS14
 #define CMPS14_ADDRESS 0x60
+const uint16_t CMPS_DELAY_TIME = 4;
+uint32_t gps_ready_time = CMPS_DELAY_TIME;
 
 bool is_triggered = false;
 
@@ -82,6 +85,21 @@ float imu_gyro_offset = -401;
 float antenna_height = 120 * 0.0254 /*metres/inch*/;
 float antenna_forward = 0;
 float antenna_left = 0;
+
+void add_checksum(char *buffer) {
+	int16_t sum = 0;
+	char tmp;
+	char checksum[4];
+
+	int8_t buf_size = strlen(buffer);
+	
+	for (int8_t i; i=0; i < buf_size)
+		sum ^= buffer[i];
+
+	sum = sum & 0x0ff;
+	sprintf(checksum,"*%02X",sum);
+	strcat(buffer,checksum);
+}
 
 void process_bno08x (uint32_t delta) {
 	float gyro;
@@ -160,6 +178,9 @@ void output_gga() {
 
 	latitude = nmeaparser.getLatitude() / 10000000.0;
 	longitude = nmeaparser.getLongitude() / 10000000.0;
+	Serial.print(latitude);
+	Serial.print(", ");
+	Serial.println(longitude);
 
 	if(nmeaparser.getAltitude(tempalt)) {
 		altitude = tempalt / 1000.0;
@@ -223,14 +244,18 @@ void output_gga() {
 		}
 	} else {
 		heading = nmeaparser.getCourse();
-		//we may have roll information from cmps14
+		//we may have roll information from cmps14, but heading comes from gps
+		//Serial.println(heading);
 	}
+	
+	//TESTING
+	imu_roll = 1;  //1 degree to left?
 
 	if (heading > -300 && imu_roll &&
 	    (nmeaparser.getFixType() == 4 ||
 	    (nmeaparser.getFixType() == 5))) {
 
-		double lat, lon, alt;
+		//double lat, lon, alt;
 
 		float heading90;
 		float tilt_offset;
@@ -247,9 +272,16 @@ void output_gga() {
 		//use the imu_roll to do terrain comp, adjust lat, lon, and altitude
 		//build a new GGA sentence, transmit it via bluetooth, and over serial
 
-		lat = latitude / 10000000.0;
-		lon = longitude / 10000000.0;
-		alt = altitude / 1000.0;
+		//lat = latitude / 10000000.0;
+		//lon = longitude / 10000000.0;
+		//alt = altitude / 1000.0;
+
+		Serial.print(latitude,7);
+		Serial.print(", ");
+		Serial.print(longitude,7);
+		Serial.print(", ");
+		Serial.print(altitude,7);
+		Serial.print(" =>");
 
 		heading90 = heading + 90;
 		if (heading90 >= 360) heading90 -= 360;
@@ -262,50 +294,70 @@ void output_gga() {
 		tilt_offset = sin(imu_roll * haversine::toRadians) * antenna_height;
 		alt_offset1 = cos(imu_roll * haversine::toRadians) * antenna_height;
 
-		haversine::move_distance_bearing(lat, lon, heading90, tilt_offset + center_offset);
-		alt -= (alt_offset1 - alt_offset2);
+		haversine::move_distance_bearing(latitude, longitude, heading90, tilt_offset + center_offset);
+		altitude -= (alt_offset1 - alt_offset2);
 
 		if (antenna_forward) {
 			//translate from GPS back to axle
-			haversine::move_distance_bearing(lat, lon, heading, -antenna_forward);
+			haversine::move_distance_bearing(latitude, longitude, heading, -antenna_forward);
 		}
 
 		//make a new GGA message. Copy unchanged parts from the original message
 		//convert lat and lon to DDMM.xxxxxx
 
+		Serial.print(latitude,7);
+		Serial.print(", ");
+		Serial.print(longitude,7);
+		Serial.print(", ");
+		Serial.print(altitude,7);
+		Serial.print(" (");
+		Serial.print(heading);
+		Serial.print(", ");
+		Serial.print(imu_roll);
+		Serial.println(")");
 
-		if (lat < 0) {
+
+
+		if (latitude < 0) {
 			latdir = 'S';
-			lat = -lat;
+			latitude = -latitude;
 		} else {
 			latdir = 'N';
 		}
 
-		if (lon < 0) {
+		if (longitude < 0) {
 			londir = 'W';
-			lon = -lon;
+			longitude = -longitude;
 		} else {
 			londir = 'E';
 		}
 
-		latdegmin = lat; //get degrees part
-		londegmin = lon;
+		latdegmin = latitude; //get degrees part
+		londegmin = longitude;
 
-		lat = (lat - latdegmin) * 60.0; //isolate the minutes
-		lon = (lon - londegmin) * 60.0;
+		latitude = (latitude - latdegmin) * 60.0; //isolate the minutes
+		longitude = (longitude - londegmin) * 60.0;
 
-		latdegmin = latdegmin * 100 + lat; //add on minutes digits
-		londegmin = londegmin * 100 + lon;
 
-		lat = lat - (int)lat; //isolate fractional part
-		lon = lon - (int)lon;
+		latdegmin = latdegmin * 100 + latitude; //add on minutes digits
+		//Serial.println(latdegmin);
+		londegmin = londegmin * 100 + longitude;
 
-		latminfrac = lat * 10000000;
-		lonminfrac = lon * 10000000;
+		latitude = latitude - (int)latitude; //isolate fractional part
+		//Serial.println(latitude,7);
+		longitude = longitude - (int)longitude;
+
+		latminfrac = latitude * 1000000.0;
+		//Serial.println(latminfrac);
+		lonminfrac = longitude * 1000000.0;
+
+
+		Serial.write((uint8_t *)gga_buffer,strnlen((const char*)gga_buffer,160));
+		Serial.write('\n');
 
 		//grab the original timestamp and stuff before the lat and lon
-		memcpy(gga_output,gga_buffer,nmeaparser.before_latlon);
-		sprintf(gga_output+nmeaparser.before_latlon+1,"%04d.%07d,%c,%05d.%07d,%c,",
+		memcpy(gga_output,gga_buffer,nmeaparser.before_latlon-1);
+		sprintf(gga_output+nmeaparser.before_latlon+1,"%04d.%06d,%c,%05d.%06d,%c,",
 		        latdegmin, latminfrac, latdir,
 				londegmin, lonminfrac, londir);
 
@@ -314,27 +366,27 @@ void output_gga() {
 		strcat(gga_output,gga_buffer+nmeaparser.after_latlon);
 
 		//write the modified altitude
-		sprintf(gga_output+strlen(gga_output),"%3.3f,", altitude);
+		sprintf(gga_output+strlen(gga_output),"%.2f,", altitude);
 
 		//now grab the rest of the original sentence
-		strcat(gga_output,gga_buffer+nmeaparser.after_altitude);
+		strncat(gga_output,gga_buffer+nmeaparser.after_altitude,strlen(gga_buffer+nmeaparser.after_altitude) - 3);
 
 		//redo the checksum
-		//TODO
+		add_checksum(gga_output);
 
 		Serial.write(gga_output);
 		Serial.write('\n');
 
 	} else {
 		//pass GGA sentence through unaltered.
-		Serial.write(gga_buffer,strnlen(gga_buffer,160));
+		Serial.write((uint8_t *)gga_buffer,strnlen((const char*)gga_buffer,160));
 		Serial.write('\n');
-		Serial.write(vtg_buffer,strnlen(vtg_buffer,160));
+		Serial.write((uint8_t *)vtg_buffer,strnlen((const char*)vtg_buffer,160));
 		Serial.write('\n');
 
-		SerialBT.write(gga_buffer,strnlen(gga_buffer,160));
+		SerialBT.write((uint8_t *)gga_buffer,strnlen((const char*)gga_buffer,160));
 		SerialBT.write('\n');
-		SerialBT.write(vtg_buffer,strnlen(vtg_buffer,160));
+		SerialBT.write((uint8_t *)vtg_buffer,strnlen((const char*)vtg_buffer,160));
 		SerialBT.write('\n');
 	}
 
@@ -342,16 +394,19 @@ void output_gga() {
 		bno08x_last_time = millis();
 		is_triggered = true;
 	}
+
+	//zero out buffer for next message
+	nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
 }
 
 void setup()
 {
 	Serial.begin(serial_speed);
-	SerialGPS.begin(gps_speed, SERIAL_8N1, GPSRX, GPSTX);
-	SerialBT.begin("esp32_f9p");
-
 	delay(5000);
 	Serial.println("F9P IMU integration.");
+
+	SerialBT.begin("esp32_f9p");
+
 
 	//pinMode(13, OUTPUT); //for an LED
 	//another LED to indicate IMU presence
@@ -399,8 +454,12 @@ void setup()
 		Serial.println("Got BNO08x.");
 		//digitalWrite(IMULED, HIGH);
 	} else {
+		Serial.println("No IMU present.");
 		//digitalWrite(IMULED, LOW);
 	}
+
+	//now start talking to f9
+	SerialGPS.begin(gps_speed, SERIAL_8N1, GPSRX, GPSTX);
 }
 
 void loop()
@@ -420,47 +479,61 @@ void loop()
 
 			if (!strcmp(nmeaparser.getMessageID(), "GGA")) {
 				last_gga = millis();
+				//Serial.print(last_gga);
+				//Serial.print(" ");
+				//Serial.print(last_vtg);
+				//Serial.println(" Got gga.");
 
 				//save a pointer to the gga buffer
 				gga_buffer = nmea_buffer[which_nmea_buffer];
 				
-				//select the other buffer
-				which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
-				nmeaparser.setBuffer(nmea_buffer[which_nmea_buffer], sizeof(nmea_buffer[0]));
-
 				//did we have a vtg message very recently?
-				if (millis() - last_vtg < 10) {
-					if (use_bno08x) {
+				if (last_gga - last_vtg < 40) {
+					//Serial.println("VTG was recent, so we're good.");
+					if (! use_cmps) {
 						output_gga(); //this will set is_triggered
 					} else {
 						gps_ready_time = millis();
 						is_triggered = true;
 					}
 					//break;
+				} else {
+					//swap buffers so we can get a more recent vtg
+					//select the other buffer
+					which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
+					nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
 				}
+
 			} else if (!strcmp(nmeaparser.getMessageID(), "VTG")) {
 				last_vtg = millis();
+				//Serial.print(last_vtg);
+				//Serial.print(" ");
+				//Serial.print(last_gga);
+				//Serial.println(" Got vtg.");
 
 				//save a pointer to the vtg buffer
 				vtg_buffer = nmea_buffer[which_nmea_buffer];
 
-				//select the other buffer
-				which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
-				nmeaparser.setBuffer(nmea_buffer[which_nmea_buffer], sizeof(nmea_buffer[0]));
-
 				//did we have a gga message very recently?
-				if (millis() - last_gga < 10) {
-					if (use_bno08x) {
+				if (last_vtg - last_gga < 40) {
+					Serial.println("GGA was recent, so we're good.");
+					if (! use_cmps) {
 						output_gga(); //this will set is_triggered
 					} else {
 						gps_ready_time = millis();
 						is_triggered = true;
 					}
 					//break;
+				} else {
+					//select the other buffer
+					which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
+					nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
 				}
 			}
 		}
 	}
+
+
 
 	current_time = millis();
 	
@@ -487,6 +560,7 @@ void loop()
 			current_time = millis();
 		}
 	}
+
 }
 
 
