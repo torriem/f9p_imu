@@ -195,12 +195,15 @@ void output_gga() {
 	double altitude;
 	long tempalt;
 
+	uint8_t fix_type;
+
 	bool new_gga = false;
 
 	heading = -301;
 
 	latitude = nmeaparser.getLatitude() / 10000000.0;
 	longitude = nmeaparser.getLongitude() / 10000000.0;
+	fix_type = nmeaparser.getFixType();
 
 	if(nmeaparser.getAltitude(tempalt)) {
 		altitude = tempalt / 1000.0;
@@ -214,7 +217,8 @@ void output_gga() {
 		if (imu_gyro_offset < -400) {
 			//no offset is known.
 
-			if (nmeaparser.getSpeed() > SPEED_THRESHOLD) {
+			if (nmeaparser.getSpeed() > SPEED_THRESHOLD &&
+			    (fix_type == 4 || fix_type ==5)) {
 				//assume we're going forward
 				heading = nmeaparser.getCourse();
 			} else {
@@ -250,7 +254,8 @@ void output_gga() {
 			if (gyro_heading < 0)         gyro_heading += 360;
 			else if (gyro_heading >= 360) gyro_heading -= 360;
 
-			if (nmeaparser.getSpeed() > SPEED_THRESHOLD &&
+			if ((fix_type == 4 || fix_type == 5) &&
+			    nmeaparser.getSpeed() > SPEED_THRESHOLD &&
 			    imu_yaw_rate < YAW_RATE_THRESHOLD) {
 				//assume we're going forward, at a decent speed, and
 				//not turning very fast.  We'll use mostly gps heading
@@ -413,6 +418,12 @@ void output_gga() {
 		Serial.println(gga_output);
 		SerialBT.println(gga_output);
 
+		sprintf(vtg_output,"$GNVTG,%.2f,T,,M,%.3f,N,%.3f,K",heading,nmeaparser.getKnots()/1000.0,
+		                                                    nmeaparser.getSpeed()/1000.0);
+		Serial.println(vtg_output);
+		//add_checksum(vtg_output, strlen(vtg_output));
+
+
 	} else {
 		//pass GGA sentence through unaltered.
 		Serial.println(gga_buffer);
@@ -512,12 +523,14 @@ void loop()
 
 	//Read RTCM data from bluetooth
 	//Is this a valid way of reading in a chunk?
+	//TODO: put this in its own task
 	avail = SerialBT.available();
 	for (uint32_t i=0; i < avail; i++) {
 		SerialGPS.write(SerialBT.read());
 	}
 
-	//Read NMEA data from GP
+	//Read NMEA data from GPS
+	//TODO put serial reading in its own task.
 	avail = SerialGPS.available();
 	while(SerialGPS.available()) {
 	//if (SerialGPS.available()) { //just one byte at a time?
