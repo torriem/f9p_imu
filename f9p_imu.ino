@@ -33,6 +33,10 @@ uint32_t last_gyro_time = 10;
 uint32_t bno08x_last_time = 10;
 bool swap_roll_pitch = false;
 const uint16_t IMU_DELAY_TIME = 190; //10 ms before the next message
+float gyro_sum;
+
+float rollK=0, Pc=0, G=0, Xp=0, Zp=0, XeRoll=0, P = 1.0f;
+float varRoll = 0.1f, varProcess = 0.0003f;
 
 //CMPS14
 #define CMPS14_ADDRESS 0x60
@@ -97,7 +101,7 @@ void add_checksum(char *buffer, uint8_t buf_size) {
 		
 		sum ^= buffer[i];
 
-	Serial.println(sum,16);
+	//Serial.println(sum,16);
 	sprintf(checksum,"*%02X",sum);
 	strcat(buffer,checksum);
 }
@@ -106,26 +110,44 @@ void process_bno08x (uint32_t delta) {
 	float gyro;
 
 	if (bno08x.dataAvailable()) {
-		gyro = bno08x.getGyroZ() * haversine::toDegrees; //yaw rate deg/s
+		gyro = -bno08x.getGyroZ() * haversine::toDegrees; //yaw rate deg/s
 		//invert sign?
 
-		bno08x_heading = bno08x.getYaw() * haversine::toDegrees;
-		//invert sign?
+		bno08x_heading = -bno08x.getYaw() * haversine::toDegrees;
+		//invert sign? Yes in my case.
+
+		if (isnan(bno08x_heading))
+			bno08x_heading = 0;
 
 		if (bno08x_heading < 0)
 			bno08x_heading += 360;
 
 		if (swap_roll_pitch) {
-			bno08x_roll = bno08x.getPitch() * haversine::toDegrees;
+			rollK = bno08x.getPitch() * haversine::toDegrees;
 			bno08x_pitch = bno08x.getRoll() * haversine::toDegrees;
 		} else {
-			bno08x_roll = bno08x.getRoll() * haversine::toDegrees;
+			rollK = bno08x.getRoll() * haversine::toDegrees;
 			bno08x_pitch = bno08x.getPitch() * haversine::toDegrees;
 			//invert pitch sign?
 		}
 
+		if (isnan(rollK))
+			rollK = 0.0;
+
+		//TODO: adjust roll for offset.
+
+		//Kalman filter on roll
+		Pc = P + varProcess;
+		G = Pc / (Pc + varRoll);
+		P = (1 - G) * Pc;
+		Xp = XeRoll;
+		Zp = Xp;
+		XeRoll = (G * (rollK - Zp)) + Xp;
+		bno08x_roll = XeRoll;
+
 		//complementary filter on the gyro yaw rate
 		bno08x_yawrate = 0.96 * bno08x_yawrate + 0.04 * gyro;
+
 	}
 	last_gyro_time = millis();
 
@@ -179,14 +201,14 @@ void output_gga() {
 
 	latitude = nmeaparser.getLatitude() / 10000000.0;
 	longitude = nmeaparser.getLongitude() / 10000000.0;
-	Serial.print(latitude);
-	Serial.print(", ");
-	Serial.println(longitude);
 
 	if(nmeaparser.getAltitude(tempalt)) {
 		altitude = tempalt / 1000.0;
 	} else
 		altitude = 0;
+
+	//TESTING:
+	imu_gyro_offset = 0; //assume started pointing straight north
 
 	if (use_bno08x) {
 		if (imu_gyro_offset < -400) {
@@ -218,16 +240,22 @@ void output_gga() {
 			}
 		} else {
 			//we have a gyro offset we can use if needed.
+			gyro_heading = imu_heading + imu_gyro_offset;
+
+			//Serial.print(gyro_heading,2);
+			//Serial.print(", fix head: ");
+			//Serial.println(nmeaparser.getCourse(),2);
+
+			//wrap around if needed
+			if (gyro_heading < 0)         gyro_heading += 360;
+			else if (gyro_heading >= 360) gyro_heading -= 360;
 
 			if (nmeaparser.getSpeed() > SPEED_THRESHOLD &&
 			    imu_yaw_rate < YAW_RATE_THRESHOLD) {
-				//assume we're going forward
+				//assume we're going forward, at a decent speed, and
+				//not turning very fast.  We'll use mostly gps heading
+				//with some gyro heading (adjust?)
 				
-				//take gps heading and merge it with gyro+offset maybe?
-				gyro_heading = imu_heading + imu_gyro_offset;
-				if (gyro_heading <0) gyro_heading += 360;
-				else if(gyro_heading >=360) gyro_heading -= 360;
-
 				heading = nmeaparser.getCourse() * 0.6 +
 				          gyro_heading * 0.4;
 
@@ -237,10 +265,9 @@ void output_gga() {
 			} else {
 				//we're either going really slow, or turning very fast
 				//rely on gyro with offset
-				heading = imu_heading + imu_gyro_offset;
-				if (heading < 0) heading += 360;
-				else if (heading >= 360) heading -= 360;
+				heading = gyro_heading;
 			}
+
 
 		}
 	} else {
@@ -250,7 +277,12 @@ void output_gga() {
 	}
 	
 	//TESTING
-	imu_roll = 1;  //1 degree to left?
+	//imu_roll = 1;  //1 degree to left?
+	//heading = 0;
+
+	Serial.print(heading);
+	Serial.print(" hr ");
+	Serial.println(imu_roll);
 
 	if (heading > -300 && imu_roll &&
 	    (nmeaparser.getFixType() == 4 ||
@@ -476,15 +508,19 @@ void setup()
 void loop()
 {	
 	uint32_t current_time;
+	uint32_t avail;
 
 	//Read RTCM data from bluetooth
-	for (int8_t i=0; i < SerialBT.available(); i++) {
+	//Is this a valid way of reading in a chunk?
+	avail = SerialBT.available();
+	for (uint32_t i=0; i < avail; i++) {
 		SerialGPS.write(SerialBT.read());
 	}
 
-	//Read NMEA data from GPS
-	//for (uint8_t i=0; i < SerialGPS.available(); i++) {
-	if (SerialGPS.available()) { //just one byte at a time?
+	//Read NMEA data from GP
+	avail = SerialGPS.available();
+	while(SerialGPS.available()) {
+	//if (SerialGPS.available()) { //just one byte at a time?
 		if(nmeaparser.process(SerialGPS.read())) {
 			//we've got a sentence
 
@@ -500,6 +536,7 @@ void loop()
 				
 				//did we have a vtg message very recently?
 				if (last_gga - last_vtg < 40) {
+					//Serial.println(last_gga - last_vtg);
 					//Serial.println("VTG was recent, so we're good.");
 					if (! use_cmps) {
 						output_gga(); //this will set is_triggered
@@ -507,13 +544,13 @@ void loop()
 						gps_ready_time = millis();
 						is_triggered = true;
 					}
-					//break;
 				} else {
 					//swap buffers so we can get a more recent vtg
 					//select the other buffer
 					which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
 					nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
 				}
+				break;
 
 			} else if (!strcmp(nmeaparser.getMessageID(), "VTG")) {
 				last_vtg = millis();
@@ -527,19 +564,20 @@ void loop()
 
 				//did we have a gga message very recently?
 				if (last_vtg - last_gga < 40) {
-					Serial.println("GGA was recent, so we're good.");
+					Serial.println(last_vtg - last_gga);
+					//Serial.println("GGA was recent, so we're good.");
 					if (! use_cmps) {
 						output_gga(); //this will set is_triggered
 					} else {
 						gps_ready_time = millis();
 						is_triggered = true;
 					}
-					//break;
 				} else {
 					//select the other buffer
 					which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
 					nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
 				}
+				break;
 			}
 		}
 	}
