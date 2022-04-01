@@ -453,6 +453,86 @@ void output_gga() {
 	nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
 }
 
+void bluetooth_to_gps (void *parameters)
+{
+	for(;;) {
+		//Read RTCM data from bluetooth, pass to GPS
+		while(SerialBT.available()) {
+			SerialGPS.write(SerialBT.read());
+		}
+		vTaskDelay (1);
+	}
+}
+
+void nmea_handler(void *parameter) {
+	for (;;) {
+		//Read NMEA data from GPS
+		//TODO put serial reading in its own task.
+		while(SerialGPS.available()) {
+			if(nmeaparser.process(SerialGPS.read())) {
+				//we've got a sentence
+
+				if (!strcmp(nmeaparser.getMessageID(), "GGA")) {
+					last_gga = millis();
+					//Serial.print(last_gga);
+					//Serial.print(" ");
+					//Serial.print(last_vtg);
+					//Serial.println(" Got gga.");
+
+					//save a pointer to the gga buffer
+					gga_buffer = nmea_buffer[which_nmea_buffer];
+					
+					//did we have a vtg message very recently?
+					if (last_gga - last_vtg < 40) {
+						//Serial.println(last_gga - last_vtg);
+						//Serial.println("VTG was recent, so we're good.");
+						if (! use_cmps) {
+							output_gga(); //this will set is_triggered
+						} else {
+							gps_ready_time = millis();
+							is_triggered = true;
+						}
+					} else {
+						//swap buffers so we can get a more recent vtg
+						//select the other buffer
+						which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
+						nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
+					}
+					break;
+
+				} else if (!strcmp(nmeaparser.getMessageID(), "VTG")) {
+					last_vtg = millis();
+					//Serial.print(last_vtg);
+					//Serial.print(" ");
+					//Serial.print(last_gga);
+					//Serial.println(" Got vtg.");
+
+					//save a pointer to the vtg buffer
+					vtg_buffer = nmea_buffer[which_nmea_buffer];
+
+					//did we have a gga message very recently?
+					if (last_vtg - last_gga < 40) {
+						Serial.println(last_vtg - last_gga);
+						//Serial.println("GGA was recent, so we're good.");
+						if (! use_cmps) {
+							output_gga(); //this will set is_triggered
+						} else {
+							gps_ready_time = millis();
+							is_triggered = true;
+						}
+					} else {
+						//select the other buffer
+						which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
+						nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
+					}
+					break;
+				}
+			}
+		}
+		vTaskDelay(1);
+	}
+}
+
 void setup()
 {
 	Serial.begin(serial_speed);
@@ -514,91 +594,23 @@ void setup()
 
 	//now start talking to f9
 	SerialGPS.begin(gps_speed, SERIAL_8N1, GPSRX, GPSTX);
+
+	//start Bluetooth RTCM pass through to GPS
+	xTaskCreate(bluetooth_to_gps, "rtcm2gps", 1000, NULL, 1, NULL);
+	//star task to parser nmea sentences from GPS
+	xTaskCreate(nmea_handler, "nmea", 1000, NULL, 1, NULL);
 }
 
 void loop()
 {	
 	uint32_t current_time;
-	uint32_t avail;
-
-	//Read RTCM data from bluetooth
-	//Is this a valid way of reading in a chunk?
-	//TODO: put this in its own task
-	avail = SerialBT.available();
-	for (uint32_t i=0; i < avail; i++) {
-		SerialGPS.write(SerialBT.read());
-	}
-
-	//Read NMEA data from GPS
-	//TODO put serial reading in its own task.
-	avail = SerialGPS.available();
-	while(SerialGPS.available()) {
-	//if (SerialGPS.available()) { //just one byte at a time?
-		if(nmeaparser.process(SerialGPS.read())) {
-			//we've got a sentence
-
-			if (!strcmp(nmeaparser.getMessageID(), "GGA")) {
-				last_gga = millis();
-				//Serial.print(last_gga);
-				//Serial.print(" ");
-				//Serial.print(last_vtg);
-				//Serial.println(" Got gga.");
-
-				//save a pointer to the gga buffer
-				gga_buffer = nmea_buffer[which_nmea_buffer];
-				
-				//did we have a vtg message very recently?
-				if (last_gga - last_vtg < 40) {
-					//Serial.println(last_gga - last_vtg);
-					//Serial.println("VTG was recent, so we're good.");
-					if (! use_cmps) {
-						output_gga(); //this will set is_triggered
-					} else {
-						gps_ready_time = millis();
-						is_triggered = true;
-					}
-				} else {
-					//swap buffers so we can get a more recent vtg
-					//select the other buffer
-					which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
-					nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
-				}
-				break;
-
-			} else if (!strcmp(nmeaparser.getMessageID(), "VTG")) {
-				last_vtg = millis();
-				//Serial.print(last_vtg);
-				//Serial.print(" ");
-				//Serial.print(last_gga);
-				//Serial.println(" Got vtg.");
-
-				//save a pointer to the vtg buffer
-				vtg_buffer = nmea_buffer[which_nmea_buffer];
-
-				//did we have a gga message very recently?
-				if (last_vtg - last_gga < 40) {
-					Serial.println(last_vtg - last_gga);
-					//Serial.println("GGA was recent, so we're good.");
-					if (! use_cmps) {
-						output_gga(); //this will set is_triggered
-					} else {
-						gps_ready_time = millis();
-						is_triggered = true;
-					}
-				} else {
-					//select the other buffer
-					which_nmea_buffer = (which_nmea_buffer + 1 ) % 2;
-					nmeaparser.setBuffer((void *)&(nmea_buffer[which_nmea_buffer][0]), sizeof(nmea_buffer[0]));
-				}
-				break;
-			}
-		}
-	}
-
-
 
 	current_time = millis();
-	
+
+	//Read from the IMU.  In the case of the BNO08x, we want to read the IMU
+	//slightly ahead of the next GPS message.  We do this by waiting a certain
+	//amount of time after the last GPS message. For 10hz, 90ms is best.  For
+	//5hz we have to figure that out by trial and error.
 	if (use_bno08x) {
 		if (is_triggered && current_time - bno08x_last_time >= IMU_DELAY_TIME) {
 			//fetch the imu parameters that will be used for the
